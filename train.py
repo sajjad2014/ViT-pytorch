@@ -227,6 +227,26 @@ def pgd_attack(x, model, eps=0.03, n_iter=10):
     return adv_x
 
 
+def ce_pgd_attack(x, labels, model, eps=0.03, n_iter=10):
+    model.eval()
+    adv_x = x.detach().clone()
+    adv_x = make_noise(adv_x, eps)
+    loss_criterion = torch.nn.CrossEntropyLoss()
+    for i in range(n_iter):
+        model.zero_grad()
+
+        adv_x.requires_grad = True
+        out, attn = model(adv_x)
+        loss = loss_criterion(out, labels)
+        loss.backward()
+        adv_x.requires_grad = False
+
+        adv_x = adv_x + (2.5 / n_iter) * eps * adv_x.grad.sign()
+        eta = torch.clamp(adv_x - x, -eps, eps)
+        adv_x = torch.clamp(x + eta, -1, 1)
+    return adv_x
+
+
 def train(args, model):
     """ Train the model """
     if args.local_rank in [-1, 0]:
@@ -275,6 +295,8 @@ def train(args, model):
     attentions = AverageMeter()
     epoch, best_acc = 0, 0
     att_criterion = torch.nn.MSELoss()
+    adv_criterion = torch.nn.CrossEntropyLoss()
+
     while True:
         model.train()
         epoch_iterator = tqdm(normal_train_loader,
@@ -286,11 +308,11 @@ def train(args, model):
         for step, batch in enumerate(epoch_iterator):
             batch = tuple(t.to(args.device) for t in batch)
             x, y = batch
-            loss, attn_weights = model(x, y)
+            _, attn_weights = model(x, y)
             attn_weights = torch.stack(attn_weights, dim=1)
-            noised_x = pgd_attack(x, model, eps=args.pgd_eps, n_iter=args.pgd_iter)
+            noised_x = ce_pgd_attack(x, y, model, eps=args.pgd_eps, n_iter=args.pgd_iter)
             model.train()
-            _, noisy_attn = model(noised_x, y)
+            loss, noisy_attn = model(noised_x, y)
             noisy_attn = torch.stack(noisy_attn, dim=1)
             attn_loss = att_criterion(attn_weights, noisy_attn)
             loss += args.attn_loss_coef * attn_loss
