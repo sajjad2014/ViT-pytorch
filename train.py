@@ -118,7 +118,9 @@ def visualize(x, noised_x, epoch, is_normal, des_name="Pics"):
     for (step, (im, noised_im)) in enumerate(zip(x, noised_x)):
         diff_im = 10 * (im - noised_im)
         diff_im.mul_(0.5).add_(0.5)
+        noised_im.mul_(0.5).add_(0.5)
         diff_im = transforms.ToPILImage()(diff_im).convert("RGB")
+        noised_im = transforms.ToPILImage()(noised_im).convert("RGB")
         image_grid([noised_im, diff_im], 1, 2).save(f'{des_name}/{epoch}_{is_normal}/im_{step}.jpg')
 
 
@@ -152,6 +154,8 @@ def valid(args, model, writer, test_loader, epoch, is_normal=True):
         model.eval()
         if step == 0:
             visualize(x.clone(), noised_x.clone(), epoch, is_normal)
+        if is_normal:
+            ce_noised_x = ce_pgd_attack(x, y, model, eps=args.pgd_eps, n_iter=args.pgd_iter)
         with torch.no_grad():
             logits, attn_weights = model(x)
             attn_weights = torch.stack(attn_weights, dim=1)
@@ -166,7 +170,6 @@ def valid(args, model, writer, test_loader, epoch, is_normal=True):
             if is_normal:
                 eval_loss = loss_fct(logits, y)
                 eval_losses.update(eval_loss.item())
-                ce_noised_x = ce_pgd_attack(x, y, model, eps=args.pgd_eps, n_iter=args.pgd_iter)
                 ce_logits, ce_noisy_attn = model(ce_noised_x)
                 ce_noisy_attn = torch.stack(ce_noisy_attn, dim=1)
                 ce_attn_loss = att_criterion(attn_weights, ce_noisy_attn)
@@ -188,7 +191,7 @@ def valid(args, model, writer, test_loader, epoch, is_normal=True):
                 all_label[0], y.detach().cpu().numpy(), axis=0
             )
         epoch_iterator.set_description(
-            "Validating... (loss=%2.5f) (att_loss=%2.6f) (att_loss_ce =%2.6f)" % (eval_losses.avg, att_losses.avg, ce_attn_loss.avg))
+            "Validating... (loss=%2.5f) (att_loss=%2.6f) (att_loss_ce =%2.6f)" % (eval_losses.avg, att_losses.avg, ce_att_losses.avg))
 
     all_preds, all_label = all_preds[0], all_label[0]
     accuracy = simple_accuracy(all_preds, all_label)
@@ -198,12 +201,12 @@ def valid(args, model, writer, test_loader, epoch, is_normal=True):
     logger.info("Epoch: %d" % epoch)
     logger.info("Valid Loss: %2.5f" % eval_losses.avg)
     logger.info("Attention Loss: %2.6f" % att_losses.avg)
-    logger.info("Attention Loss CE: %2.5f" % ce_attn_loss.avg)
+    logger.info("Attention Loss CE: %2.5f" % ce_att_losses.avg)
     logger.info("Valid Accuracy: %2.5f" % accuracy)
 
     writer.add_scalar("test/accuracy", scalar_value=accuracy, global_step=epoch)
     if is_normal:
-        return accuracy, all_attn_loss, eval_losses.avg, ce_eval_loss.avg, ce_attn_loss.avg
+        return accuracy, all_attn_loss, eval_losses.avg, ce_losses.avg, ce_att_losses.avg
     else:
         return accuracy, all_attn_loss
 
