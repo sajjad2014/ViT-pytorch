@@ -145,7 +145,7 @@ def visualize(x, noised_x, epoch, is_normal, des_name="Pics"):
 
 
 def get_att_mask(att_mat):
-    att_mat = torch.stack(att_mat)
+    att_mat = torch.stack(att_mat).detach()
     att_mat = torch.mean(att_mat, dim=2)
     residual_att = torch.eye(att_mat.size(2)).to('cuda')
     aug_att_mat = att_mat + residual_att
