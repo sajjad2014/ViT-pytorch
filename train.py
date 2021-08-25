@@ -10,7 +10,7 @@ import pandas as pd
 from torch.autograd import Variable
 
 from datetime import timedelta
-
+import cv2
 import torch
 import torch.distributed as dist
 import matplotlib.pyplot as plt
@@ -110,6 +110,26 @@ def image_grid(imgs, rows, cols):
     return grid
 
 
+def visualize_attention(x, mask, epoch, is_normal, des_name="Pics_atten"):
+    x = x.clone()
+    mask = mask.clone()
+    if not os.path.exists(f"{des_name}"):
+        os.makedirs(f"{des_name}")
+    if not os.path.exists(f"{des_name}/{epoch}_{is_normal}"):
+        os.makedirs(f"{des_name}/{epoch}_{is_normal}")
+    for (step, (im, mask_att)) in enumerate(zip(x, mask)):
+        mask_att = mask_att.detach().to('cpu').numpy()
+        im = im.detach().to('cpu').permute(1, 2, 0).numpy()
+        mask_resize = cv2.resize(mask_att / mask_att.max(), im.shape[:2])[..., np.newaxis]
+        im = (0.5 * im + 0.5) * 255
+        masked_im = (mask_resize * im).astype("uint8")
+        heat_map = cv2.applyColorMap((mask_resize[:, :, 0] * 255).astype("uint8"), cv2.COLORMAP_HOT)
+        im = transforms.ToPILImage()(im.astype("uint8")).convert("RGB")
+        masked_im = transforms.ToPILImage()(masked_im).convert("RGB")
+        heat_map = transforms.ToPILImage()(heat_map[:, :, [2, 1, 0]]).convert("RGB")
+        image_grid([im, masked_im, heat_map], 1, 3).save(f'{des_name}/{epoch}_{is_normal}/im_{step}.jpg')
+
+
 def visualize(x, noised_x, epoch, is_normal, des_name="Pics"):
     if not os.path.exists(f"{des_name}"):
         os.makedirs(f"{des_name}")
@@ -124,17 +144,37 @@ def visualize(x, noised_x, epoch, is_normal, des_name="Pics"):
         image_grid([noised_im, diff_im], 1, 2).save(f'{des_name}/{epoch}_{is_normal}/im_{step}.jpg')
 
 
+def get_att_mask(att_mat):
+    att_mat = torch.stack(att_mat)
+    att_mat = torch.mean(att_mat, dim=2)
+    residual_att = torch.eye(att_mat.size(2)).to('cuda')
+    aug_att_mat = att_mat + residual_att
+    aug_att_mat = aug_att_mat / aug_att_mat.sum(dim=-1).unsqueeze(-1)
+    joint_attentions = torch.zeros(aug_att_mat.size()).to('cuda')
+    joint_attentions[0] = aug_att_mat[0]
+    for n in range(1, aug_att_mat.size(0)):
+        joint_attentions[n] = torch.matmul(aug_att_mat[n], joint_attentions[n - 1])
+    v = joint_attentions[-1]
+    grid_size = int(np.sqrt(aug_att_mat.size(-1)))
+    mask = v[:, 0, 1:].reshape(-1, grid_size, grid_size)
+    return mask
+
+
 def valid(args, model, writer, test_loader, epoch, is_normal=True):
     # Validation!
     eval_losses = AverageMeter()
     att_losses = AverageMeter()
-
+    ce_losses = AverageMeter()
+    ce_att_losses = AverageMeter()
+    new_att_losses = AverageMeter()
+    new_ce_att_losses = AverageMeter()
     logger.info("***** Running Validation *****")
     logger.info("  Num steps = %d", len(test_loader))
     logger.info("  Batch size = %d", args.eval_batch_size)
 
     model.eval()
     all_preds, all_label = [], []
+    all_preds_ce, all_label_ce = [], []
     all_attn_loss = []
     epoch_iterator = tqdm(test_loader,
                           desc="Validating... (loss=X.X) (att_loss=X.X)",
@@ -152,21 +192,41 @@ def valid(args, model, writer, test_loader, epoch, is_normal=True):
         model.eval()
         if step == 0:
             visualize(x.clone(), noised_x.clone(), epoch, is_normal)
+        if is_normal:
+            ce_noised_x = ce_pgd_attack(x, y, model, eps=args.pgd_eps, n_iter=args.pgd_iter)
         with torch.no_grad():
             logits, attn_weights = model(x)
-            attn_weights = torch.stack(attn_weights, dim=1)
+            attn_stack = torch.stack(attn_weights, dim=1)
 
             _, noisy_attn = model(noised_x)
-            noisy_attn = torch.stack(noisy_attn, dim=1)
-
-            attn_loss = att_criterion(attn_weights, noisy_attn)
-
+            noisy_attn_stack = torch.stack(noisy_attn, dim=1)
+            att_mask = get_att_mask(attn_weights)
+            if step == 0:
+                visualize_attention(x, att_mask, epoch, is_normal, "Pics_Attn_Normal")
+            noisy_mask = get_att_mask(attn_weights)
+            attn_loss = att_criterion(attn_stack, noisy_attn_stack)
+            new_att_loss = torch.nn.functional.mse_loss(att_mask, noisy_mask)
+            new_att_losses.update(new_att_loss.item())
             att_losses.update(attn_loss.item())
             all_attn_loss.append(attn_loss.item())
             if is_normal:
                 eval_loss = loss_fct(logits, y)
                 eval_losses.update(eval_loss.item())
+                ce_logits, ce_noisy_attn = model(ce_noised_x)
+                ce_noisy_attn_stak = torch.stack(ce_noisy_attn, dim=1)
+                ce_attn_loss = att_criterion(attn_stack, ce_noisy_attn_stak)
+                ce_att_mask = get_att_mask(ce_noisy_attn)
+                if step == 0:
+                    visualize_attention(ce_noised_x, ce_att_mask, epoch, is_normal, "Pics_Attn_CE")
+                new_ce_att_loss = torch.nn.functional.mse_loss(att_mask, ce_att_mask)
+                new_ce_att_losses.update(new_ce_att_loss.item())
 
+                ce_eval_loss = loss_fct(ce_logits, y)
+                ce_losses.update(ce_eval_loss.item())
+                ce_att_losses.update(ce_attn_loss.item())
+                if step == 0:
+                    visualize(x.clone(), ce_noised_x.clone(), epoch, is_normal, "CE-Pics")
+                preds_ce = torch.argmax(ce_logits, dim=-1)
             preds = torch.argmax(logits, dim=-1)
 
         if len(all_preds) == 0:
@@ -179,22 +239,41 @@ def valid(args, model, writer, test_loader, epoch, is_normal=True):
             all_label[0] = np.append(
                 all_label[0], y.detach().cpu().numpy(), axis=0
             )
+
+        if len(all_preds_ce) == 0:
+            all_preds_ce.append(preds_ce.detach().cpu().numpy())
+            all_label_ce.append(y.detach().cpu().numpy())
+        else:
+            all_preds_ce[0] = np.append(
+                all_preds_ce[0], preds_ce.detach().cpu().numpy(), axis=0
+            )
+            all_label_ce[0] = np.append(
+                all_label_ce[0], y.detach().cpu().numpy(), axis=0
+            )
         epoch_iterator.set_description(
-            "Validating... (loss=%2.5f) (att_loss=%2.6f)" % (eval_losses.avg, att_losses.avg))
+            "Validating... (loss=%2.5f) (att_loss=%2.6f) (att_loss_ce =%2.6f)"
+            % (eval_losses.avg, att_losses.avg, ce_att_losses.avg))
 
     all_preds, all_label = all_preds[0], all_label[0]
     accuracy = simple_accuracy(all_preds, all_label)
+
+    all_preds_ce, all_label_ce = all_preds_ce[0], all_label_ce[0]
+    accuracy_ce = simple_accuracy(all_preds_ce, all_label_ce)
 
     logger.info("\n")
     logger.info("Validation Results")
     logger.info("Epoch: %d" % epoch)
     logger.info("Valid Loss: %2.5f" % eval_losses.avg)
     logger.info("Attention Loss: %2.6f" % att_losses.avg)
+    logger.info("Attention Loss CE: %2.5f" % ce_att_losses.avg)
+    logger.info("New Attention Loss: %2.5f" % new_att_losses.avg)
+    logger.info("New Attention Loss CE: %2.5f" % new_ce_att_losses.avg)
     logger.info("Valid Accuracy: %2.5f" % accuracy)
+    logger.info("Valid Accuracy CE: %2.5f" % accuracy_ce)
 
     writer.add_scalar("test/accuracy", scalar_value=accuracy, global_step=epoch)
     if is_normal:
-        return accuracy, all_attn_loss, eval_losses.avg
+        return accuracy, all_attn_loss, eval_losses.avg, ce_losses.avg, ce_att_losses.avg, new_att_losses.avg, new_ce_att_losses.avg, accuracy_ce
     else:
         return accuracy, all_attn_loss
 
@@ -218,6 +297,26 @@ def pgd_attack(x, model, eps=0.03, n_iter=10):
         out, attn = model(adv_x)
         attn = torch.stack(attn, dim=1)
         loss = torch.nn.functional.mse_loss(attn, target_attn)
+        loss.backward()
+        adv_x.requires_grad = False
+
+        adv_x = adv_x + (2.5 / n_iter) * eps * adv_x.grad.sign()
+        eta = torch.clamp(adv_x - x, -eps, eps)
+        adv_x = torch.clamp(x + eta, -1, 1)
+    return adv_x
+
+
+def ce_pgd_attack(x, labels, model, eps=0.03, n_iter=10):
+    model.eval()
+    adv_x = x.detach().clone()
+    adv_x = make_noise(adv_x, eps)
+    loss_criterion = torch.nn.CrossEntropyLoss()
+    for i in range(n_iter):
+        model.zero_grad()
+
+        adv_x.requires_grad = True
+        out, attn = model(adv_x)
+        loss = loss_criterion(out, labels)
         loss.backward()
         adv_x.requires_grad = False
 
@@ -273,6 +372,7 @@ def train(args, model):
     set_seed(args)  # Added here for reproducibility (even between python 2 and 3)
     losses = AverageMeter()
     attentions = AverageMeter()
+    new_attentions = AverageMeter()
     epoch, best_acc = 0, 0
     att_criterion = torch.nn.MSELoss()
     while True:
@@ -287,14 +387,19 @@ def train(args, model):
             batch = tuple(t.to(args.device) for t in batch)
             x, y = batch
             _, attn_weights = model(x, y)
+            attn_mask = get_att_mask(attn_weights)
+            if step == 0:
+                visualize_attention(x, attn_mask, epoch, True, "Pics_Train_Normal")
             attn_weights = torch.stack(attn_weights, dim=1)
-            noised_x = pgd_attack(x, model, eps=args.pgd_eps, n_iter=args.pgd_iter)
+            noised_x = ce_pgd_attack(x, y, model, eps=args.pgd_eps, n_iter=args.pgd_iter)
             model.train()
             loss, noisy_attn = model(noised_x, y)
+            attn_mask_ce = get_att_mask(noisy_attn)
+            if step == 0:
+                visualize_attention(noised_x, attn_mask_ce, epoch, True, "Pics_Train_CE")
             noisy_attn = torch.stack(noisy_attn, dim=1)
             attn_loss = att_criterion(attn_weights, noisy_attn)
-            loss += args.attn_loss_coef * attn_loss
-
+            new_att_loss = torch.nn.functional.mse_loss(attn_mask, attn_mask_ce)
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
             if args.fp16:
@@ -304,6 +409,7 @@ def train(args, model):
                 loss.backward()
             losses.update(loss.item() * args.gradient_accumulation_steps)
             attentions.update(attn_loss.item())
+            new_attentions.update(new_att_loss.item())
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 if args.fp16:
                     torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
@@ -314,8 +420,8 @@ def train(args, model):
                 optimizer.zero_grad()
 
                 epoch_iterator.set_description(
-                    "Training (%d / %d Steps) (loss=%2.5f) (att_loss=%2.6f)" % (
-                    epoch, t_total, losses.avg, attentions.avg)
+                    "Training (%d / %d Steps) (loss=%2.5f) (att_loss=%2.6f) (new_att_loss=%2.6f)" % (
+                    epoch, t_total, losses.avg, attentions.avg, new_attentions.avg)
                 )
                 if args.local_rank in [-1, 0]:
                     writer.add_scalar("train/loss", scalar_value=losses.val, global_step=epoch)
@@ -324,22 +430,24 @@ def train(args, model):
         optimizer.zero_grad()
         if args.local_rank in [-1, 0]:
             epoch += 1
-            accuracy, normal_attn_losses, normal_eval_loss = valid(args, model, writer, normal_val_loader, epoch)
-            outlier, outlier_attn_losses = valid(args, model, writer, outlier_val_loader, epoch, is_normal=False)
-            auc = roc_auc_score([0] * len(normal_attn_losses) + [1] * len(outlier_attn_losses),
-                                normal_attn_losses + outlier_attn_losses)
+            accuracy, normal_attn_losses, normal_eval_loss,\
+            ce_eval_loss, ce_attn_loss, new_att_loss, new_ce_att_loss, accuracy_ce = valid(args, model, writer, normal_val_loader, epoch)
+            # outlier, outlier_attn_losses = valid(args, model, writer, outlier_val_loader, epoch, is_normal=False)
+            # auc = roc_auc_score([0] * len(normal_attn_losses) + [1] * len(outlier_attn_losses),
+            #                     normal_attn_losses + outlier_attn_losses)
             normal_np = np.array(normal_attn_losses)
-            outlier_np = np.array(outlier_attn_losses)
-            val_csv_writer.add_record([epoch, auc, normal_np.mean(), outlier_np.mean(),
-                                       normal_eval_loss + args.attn_loss_coef * normal_np.mean(), accuracy])
-            logger.info('AUC Score: %.5f' % auc)
+            # outlier_np = np.array(outlier_attn_losses)
+            val_csv_writer.add_record([epoch, normal_np.mean(),
+                                       normal_eval_loss, ce_attn_loss, ce_eval_loss, new_att_loss, new_ce_att_loss, accuracy, accuracy_ce])
+            # logger.info('AUC Score: %.5f' % auc)
             if best_acc < accuracy:
                 save_model(args, model)
                 best_acc = accuracy
             model.train()
-            train_csv_writer.add_record([epoch, losses.avg, attentions.avg])
+            train_csv_writer.add_record([epoch, losses.avg, attentions.avg, new_attentions.avg])
             losses.reset()
             attentions.reset()
+            new_attentions.reset()
         if epoch % t_total == 0:
             break
 
@@ -419,10 +527,10 @@ def main():
     global train_csv_writer
     global val_csv_writer
     train_csv_writer = CSV_Writer(path=args.csv_path + args.name + '_train.csv',
-                                  columns=(['epoch', 'train_loss', 'train_attention_loss']))
+                                  columns=(['epoch', 'train_loss', 'train_attention_loss', 'new_train_attention_loss']))
     val_csv_writer = CSV_Writer(path=args.csv_path + args.name + '_val.csv',
-                                columns=(['epoch', 'auc', 'normal_attention_loss',
-                                          'oulier_attention_loss', 'normal_loss', 'accuracy']))
+                                columns=(['epoch', 'normal_attention_loss'
+                                          , 'normal_loss', 'ce_attention_loss', 'ce_eval_loss', 'new_att_loss', 'new_ce_att_loss','accuracy', 'accuracy_ce']))
 
     # Setup CUDA, GPU & distributed training 
     if args.local_rank == -1:
