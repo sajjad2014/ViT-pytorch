@@ -203,7 +203,7 @@ def valid(args, model, writer, test_loader, epoch, is_normal=True):
             att_mask = get_att_mask(attn_weights)
             if step == 0:
                 visualize_attention(x, att_mask, epoch, is_normal, "Pics_Attn_Normal")
-            noisy_mask = get_att_mask(attn_weights)
+            noisy_mask = get_att_mask(noisy_attn)
             attn_loss = att_criterion(attn_stack, noisy_attn_stack)
             new_att_loss = torch.nn.functional.mse_loss(att_mask, noisy_mask)
             new_att_losses.update(new_att_loss.item())
