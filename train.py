@@ -13,7 +13,6 @@ from datetime import timedelta
 import cv2
 import torch
 import torch.distributed as dist
-import matplotlib.pyplot as plt
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 # from apex import amp
@@ -139,8 +138,8 @@ def visualize(x, noised_x, epoch, is_normal, des_name="Pics"):
         diff_im = 10 * (im - noised_im)
         diff_im.mul_(0.5).add_(0.5)
         noised_im.mul_(0.5).add_(0.5)
-        diff_im = transforms.ToPILImage()(diff_im).convert("RGB")
-        noised_im = transforms.ToPILImage()(noised_im).convert("RGB")
+        diff_im = transforms.ToPILImage()(diff_im.to('cpu')).convert("RGB")
+        noised_im = transforms.ToPILImage()(noised_im.to('cpu')).convert("RGB")
         image_grid([noised_im, diff_im], 1, 2).save(f'{des_name}/{epoch}_{is_normal}/im_{step}.jpg')
 
 
