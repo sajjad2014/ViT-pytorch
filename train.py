@@ -180,19 +180,15 @@ def get_att_mask(att_mat):
 def valid(args, model, writer, test_loader, epoch, is_normal=True):
     # Validation!
     eval_losses = AverageMeter()
-    eval_losses_adv = AverageMeter()
-    att_losses = AverageMeter()
-    att_rollout_losses = AverageMeter()
     logger.info("***** Running Validation *****")
     logger.info("  Num steps = %d", len(test_loader))
     logger.info("  Batch size = %d", args.eval_batch_size)
 
     model.eval()
-    all_preds, all_label, all_preds_adv = [], [], []
-    all_attn_loss, all_attn_rollout_loss = [], []
-    all_max_softmax, all_max_softmax_adv = [], []
+    all_preds, all_label = [], []
+    all_max_softmax = []
     epoch_iterator = tqdm(test_loader,
-                          desc="Validating... (loss=X.X) (att_loss=X.X)",
+                          desc="Validating... (loss=X.X)",
                           bar_format="{l_bar}{r_bar}",
                           dynamic_ncols=True,
                           disable=args.local_rank not in [-1, 0],
@@ -210,41 +206,13 @@ def valid(args, model, writer, test_loader, epoch, is_normal=True):
             logits, attn_weights = model(x)
             attn_stack = torch.stack(attn_weights, dim=1)
 
-            logits_adv, noisy_attn = model(noised_x)
-            noisy_attn_stack = torch.stack(noisy_attn, dim=1)
-
-            attn_diff = (attn_stack - noisy_attn_stack) ** 2
-            att_losses.update(attn_diff.mean().item())
-            batch_attn = torch.mean(attn_diff, tuple(range(1, attn_diff.ndim))).detach().cpu().numpy()
-            if len(all_attn_loss) == 0:
-                all_attn_loss.append(batch_attn)
-            else:
-                all_attn_loss[0] = np.append(
-                    all_attn_loss[0], batch_attn, axis=0
-                )
-
             att_mask = get_att_mask(attn_weights)
-            noisy_mask = get_att_mask(noisy_attn)
             if step == 0:
                 visualize_attention(x, att_mask, epoch, is_normal, "Pics_Attn_Normal")
-                visualize_attention(noised_x, noisy_mask, epoch, is_normal, "Pics_Attn_Attacked")
-
-            attn_rollout_diff = (att_mask - noisy_mask) ** 2
-            att_rollout_losses.update(attn_rollout_diff.mean().item())
-            batch_attn = torch.mean(attn_rollout_diff, tuple(range(1, attn_rollout_diff.ndim))).detach().cpu().numpy()
-            if len(all_attn_rollout_loss) == 0:
-                all_attn_rollout_loss.append(batch_attn)
-            else:
-                all_attn_rollout_loss[0] = np.append(
-                    all_attn_rollout_loss[0], batch_attn, axis=0
-                )
 
             if is_normal:
                 eval_loss = loss_fct(logits, y)
                 eval_losses.update(eval_loss.item())
-
-                eval_loss_adv = loss_fct(logits_adv, y)
-                eval_losses_adv.update(eval_loss_adv.item())
 
             softmax = torch.nn.functional.softmax(logits, dim=1)
             max_softmax = torch.max(softmax, 1).values.detach().cpu().numpy()
@@ -255,53 +223,34 @@ def valid(args, model, writer, test_loader, epoch, is_normal=True):
                     all_max_softmax[0], max_softmax, axis=0
                 )
 
-            softmax_adv = torch.nn.functional.softmax(logits_adv, dim=1)
-            max_softmax_adv = torch.max(softmax_adv, 1).values.detach().cpu().numpy()
-            if len(all_max_softmax_adv) == 0:
-                all_max_softmax_adv.append(max_softmax_adv)
-            else:
-                all_max_softmax_adv[0] = np.append(
-                    all_max_softmax_adv[0], max_softmax_adv, axis=0
-                )
-
             preds = torch.argmax(logits, dim=-1)
-            adv_preds = torch.argmax(logits_adv, dim=-1)
 
         if len(all_preds) == 0:
             all_preds.append(preds.detach().cpu().numpy())
-            all_preds_adv.append(adv_preds.detach().cpu().numpy())
             all_label.append(y.detach().cpu().numpy())
         else:
             all_preds[0] = np.append(
                 all_preds[0], preds.detach().cpu().numpy(), axis=0
             )
-            all_preds_adv[0] = np.append(
-                all_preds_adv[0], adv_preds.detach().cpu().numpy(), axis=0
-            )
             all_label[0] = np.append(
                 all_label[0], y.detach().cpu().numpy(), axis=0
             )
         epoch_iterator.set_description(
-            "Validating... (loss=%2.5f) (att_loss=%2.6f)" % (eval_losses.avg, att_losses.avg))
+            "Validating... (loss=%2.5f)" % (eval_losses.avg))
 
-    all_preds, all_preds_adv, all_label = all_preds[0], all_preds_adv[0], all_label[0]
+    all_preds, all_label = all_preds[0], all_label[0]
     accuracy = simple_accuracy(all_preds, all_label)
-    accuracy_adv = simple_accuracy(all_preds_adv, all_label)
     logger.info("\n")
     logger.info("Validation Results")
     logger.info("Epoch: %d" % epoch)
     logger.info("Valid Loss: %2.5f" % eval_losses.avg)
-    logger.info("Attention Loss: %2.6f" % att_losses.avg)
     logger.info("Valid Accuracy: %2.5f" % accuracy)
 
     writer.add_scalar("test/accuracy", scalar_value=accuracy, global_step=epoch)
     if is_normal:
-        return accuracy, accuracy_adv, att_losses.avg, att_rollout_losses.avg, all_attn_loss[0], \
-               all_attn_rollout_loss[0], all_max_softmax[0], all_max_softmax_adv[
-                   0], eval_losses.avg, eval_losses_adv.avg
+        return accuracy, all_max_softmax[0], eval_losses.avg
     else:
-        return att_losses.avg, att_rollout_losses.avg, all_attn_loss[0], all_attn_rollout_loss[0], all_max_softmax[0], \
-               all_max_softmax_adv[0]
+        return all_max_softmax[0]
 
 
 def make_noise(x, epsilon=0.03):
@@ -377,15 +326,13 @@ def train(args, model):
     model.zero_grad()
     set_seed(args)  # Added here for reproducibility (even between python 2 and 3)
     losses = AverageMeter()
-    attentions = AverageMeter()
     epoch, best_acc = 0, 0
-    att_criterion = torch.nn.MSELoss()
     if args.training_weights_dir:
         epoch, normal_train_loader = load_model_training(args, model, optimizer, scheduler)
     while True:
         model.train()
         epoch_iterator = tqdm(normal_train_loader,
-                              desc="Training (X / X Steps) (loss=X.X) (att_loss=X.X)",
+                              desc="Training (X / X Steps) (loss=X.X)",
                               bar_format="{l_bar}{r_bar}",
                               dynamic_ncols=True,
                               disable=args.local_rank not in [-1, 0],
@@ -393,20 +340,11 @@ def train(args, model):
         for step, batch in enumerate(epoch_iterator):
             batch = tuple(t.to(args.device) for t in batch)
             x, y = batch
-            _, attn_weights = model(x, y)
+            loss, attn_weights = model(x, y)
             attn_mask = get_att_mask(attn_weights)
             if step == 0:
                 visualize_attention(x, attn_mask, epoch, True, "Pics_Train_Normal")
             attn_weights = torch.stack(attn_weights, dim=1)
-            noised_x = pgd_attack(x, model, eps=args.pgd_eps, n_iter=args.pgd_iter)
-            model.train()
-            loss, noisy_attn = model(noised_x, y)
-            attn_mask_adv = get_att_mask(noisy_attn)
-            if step == 0:
-                visualize_attention(noised_x, attn_mask_adv, epoch, True, "Pics_Train_Adv")
-            noisy_attn = torch.stack(noisy_attn, dim=1)
-            attn_loss = att_criterion(attn_weights, noisy_attn)
-            loss += args.attn_loss_coef * attn_loss
 
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
@@ -416,7 +354,6 @@ def train(args, model):
             else:
                 loss.backward()
             losses.update(loss.item() * args.gradient_accumulation_steps)
-            attentions.update(attn_loss.item())
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 if args.fp16:
                     torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
@@ -427,8 +364,8 @@ def train(args, model):
                 optimizer.zero_grad()
 
                 epoch_iterator.set_description(
-                    "Training (%d / %d Steps) (loss=%2.5f) (att_loss=%2.6f)" % (
-                        epoch, t_total, losses.avg, attentions.avg)
+                    "Training (%d / %d Steps) (loss=%2.5f) " % (
+                        epoch, t_total, losses.avg)
                 )
                 if args.local_rank in [-1, 0]:
                     writer.add_scalar("train/loss", scalar_value=losses.val, global_step=epoch)
@@ -438,36 +375,22 @@ def train(args, model):
         if args.local_rank in [-1, 0]:
             epoch += 1
 
-            accuracy, accuracy_adv, normal_attn_loss, normal_rollout_loss, normal_all_attn_loss, normal_all_attn_rollout_loss, \
-            normal_all_max_softmax, normal_all_max_softmax_adv, eval_loss, eval_losses_adv = valid(args, model, writer,
-                                                                                            normal_val_loader, epoch)
+            accuracy, normal_all_max_softmax, eval_loss = valid(args, model, writer, normal_val_loader, epoch)
 
-            outlier_attn_loss, outlier_att_rollout_loss, outlier_all_attn_loss, outlier_all_attn_rollout_loss, \
-            outlier_all_max_softmax, outlier_all_max_softmax_adv = valid(args, model, writer, outlier_val_loader, epoch,
-                                                                         is_normal=False)
-
-            attn_auc = roc_auc_score([0] * len(normal_all_attn_loss) + [1] * len(outlier_all_attn_loss),
-                                     np.append(normal_all_attn_loss, outlier_all_attn_loss, axis=0))
-
-            attn_rollout_auc = roc_auc_score([0] * len(normal_all_attn_rollout_loss) + [1] * len(outlier_all_attn_rollout_loss),
-                                     np.append(normal_all_attn_rollout_loss, outlier_all_attn_rollout_loss, axis=0))
+            outlier_all_max_softmax= valid(args, model, writer, outlier_val_loader, epoch, is_normal=False)
 
             max_softmax_auc = roc_auc_score([0] * len(outlier_all_max_softmax) + [1] * len(normal_all_max_softmax),
                                      np.append(outlier_all_max_softmax, normal_all_max_softmax, axis=0))
 
-            max_softmax_adv_auc = roc_auc_score([0] * len(outlier_all_max_softmax_adv) + [1] * len(normal_all_max_softmax_adv),
-                                     np.append(outlier_all_max_softmax_adv, normal_all_max_softmax_adv, axis=0))
+            val_csv_writer.add_record([epoch, accuracy, max_softmax_auc, eval_loss])
 
-            val_csv_writer.add_record([epoch, accuracy, accuracy_adv, normal_attn_loss, normal_rollout_loss, outlier_attn_loss,
-                                       outlier_att_rollout_loss, attn_auc, attn_rollout_auc, max_softmax_auc, max_softmax_adv_auc, eval_loss, eval_losses_adv])
             logger.info('AUC Score: %.5f' % max_softmax_auc)
             save_model_training(args, epoch, model, optimizer, scheduler, normal_train_loader)
             if best_acc < accuracy:
                 best_acc = accuracy
             model.train()
-            train_csv_writer.add_record([epoch, losses.avg, attentions.avg])
+            train_csv_writer.add_record([epoch, losses.avg])
             losses.reset()
-            attentions.reset()
         if epoch % t_total == 0:
             break
 
@@ -550,12 +473,10 @@ def main():
     global val_csv_writer
 
     train_csv_writer = CSV_Writer(path=args.csv_path + args.name + '_train.csv',
-                                  columns=(['epoch', 'train_loss', 'train_attention_loss']))
+                                  columns=(['epoch', 'train_loss']))
 
     val_csv_writer = CSV_Writer(path=args.csv_path + args.name + '_val.csv',
-                                columns=(['epoch', 'accuracy', 'accuracy_adv', 'normal_attn_loss', 'normal_rollout_loss',
-                                          'outlier_attn_loss', 'outlier_att_rollout_loss', 'attn_auc', 'attn_rollout_auc',
-                                          'max_softmax_auc', 'max_softmax_adv_auc', 'eval_loss', 'eval_losses_adv']))
+                                columns=(['epoch', 'accuracy', 'max_softmax_auc', 'eval_loss']))
 
     # Setup CUDA, GPU & distributed training 
     if args.local_rank == -1:
