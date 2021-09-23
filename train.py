@@ -137,7 +137,7 @@ def visualize_attention(x, mask, epoch, is_normal, des_name="Pics_atten"):
     for (step, (im, mask_att)) in enumerate(zip(x, mask)):
         mask_att = mask_att.detach().to('cpu').numpy()
         im = im.detach().to('cpu').permute(1, 2, 0).numpy()
-        mask_resize = cv2.resize(mask_att / mask_att.max(), im.shape[:2])[..., np.newaxis]
+        mask_resize = cv2.resize(mask_att, im.shape[:2])[..., np.newaxis]
         im = (0.5 * im + 0.5) * 255
         masked_im = (mask_resize * im).astype("uint8")
         heat_map = cv2.applyColorMap((mask_resize[:, :, 0] * 255).astype("uint8"), cv2.COLORMAP_HOT)
@@ -162,7 +162,7 @@ def visualize(x, noised_x, epoch, is_normal, des_name="Pics"):
 
 
 def get_att_mask(att_mat):
-    att_mat = torch.stack(att_mat).detach()
+    att_mat = torch.stack(att_mat)
     att_mat = torch.mean(att_mat, dim=2)
     residual_att = torch.eye(att_mat.size(2)).to('cuda')
     aug_att_mat = att_mat + residual_att
@@ -170,25 +170,27 @@ def get_att_mask(att_mat):
     joint_attentions = torch.zeros(aug_att_mat.size()).to('cuda')
     joint_attentions[0] = aug_att_mat[0]
     for n in range(1, aug_att_mat.size(0)):
-        joint_attentions[n] = torch.matmul(aug_att_mat[n], joint_attentions[n - 1])
+        joint_attentions[n] = torch.matmul(aug_att_mat[n], joint_attentions[n - 1].clone())
     v = joint_attentions[-1]
     grid_size = int(np.sqrt(aug_att_mat.size(-1)))
     mask = v[:, 0, 1:].reshape(-1, grid_size, grid_size)
-    return mask
+    return mask / torch.amax(mask, dim=(1, 2)).reshape((-1, 1, 1))
 
 
 def valid(args, model, writer, test_loader, epoch, is_normal=True):
     # Validation!
     eval_losses = AverageMeter()
+    att_losses = AverageMeter()
     logger.info("***** Running Validation *****")
     logger.info("  Num steps = %d", len(test_loader))
     logger.info("  Batch size = %d", args.eval_batch_size)
 
     model.eval()
     all_preds, all_label = [], []
+    all_attn_loss = []
     all_max_softmax = []
     epoch_iterator = tqdm(test_loader,
-                          desc="Validating... (loss=X.X)",
+                          desc="Validating... (loss=X.X) (att_loss=X.X)",
                           bar_format="{l_bar}{r_bar}",
                           dynamic_ncols=True,
                           disable=args.local_rank not in [-1, 0],
@@ -206,9 +208,28 @@ def valid(args, model, writer, test_loader, epoch, is_normal=True):
             logits, attn_weights = model(x)
             attn_stack = torch.stack(attn_weights, dim=1)
 
-            att_mask = get_att_mask(attn_weights)
+            attn_mask = get_att_mask(attn_weights)
             if step == 0:
-                visualize_attention(x, att_mask, epoch, is_normal, "Pics_Attn_Normal")
+                visualize_attention(x, attn_mask, epoch, is_normal, "Pics_Test_Normal")
+
+            rotation_deg = 90
+            x_r = transforms.functional.rotate(x, rotation_deg)
+            logits_r, attn_weights_r = model(x_r)
+
+            attn_mask_r = get_att_mask(attn_weights_r)
+            if step == 0:
+                visualize_attention(x_r, attn_mask_r, epoch, True, "Pics_Test_Rotated")
+
+            attn_mask_r_reverse = transforms.functional.rotate(attn_mask_r, -rotation_deg)
+            attn_diff = (attn_mask - attn_mask_r_reverse) ** 2
+            att_losses.update(attn_diff.mean().item())
+            batch_attn = torch.mean(attn_diff, tuple(range(1, attn_diff.ndim))).detach().cpu().numpy()
+            if len(all_attn_loss) == 0:
+                all_attn_loss.append(batch_attn)
+            else:
+                all_attn_loss[0] = np.append(
+                    all_attn_loss[0], batch_attn, axis=0
+                )
 
             if is_normal:
                 eval_loss = loss_fct(logits, y)
@@ -236,7 +257,7 @@ def valid(args, model, writer, test_loader, epoch, is_normal=True):
                 all_label[0], y.detach().cpu().numpy(), axis=0
             )
         epoch_iterator.set_description(
-            "Validating... (loss=%2.5f)" % (eval_losses.avg))
+            "Validating... (loss=%2.5f) (att_loss=%2.6f)" % (eval_losses.avg, att_losses.avg))
 
     all_preds, all_label = all_preds[0], all_label[0]
     accuracy = simple_accuracy(all_preds, all_label)
@@ -244,13 +265,14 @@ def valid(args, model, writer, test_loader, epoch, is_normal=True):
     logger.info("Validation Results")
     logger.info("Epoch: %d" % epoch)
     logger.info("Valid Loss: %2.5f" % eval_losses.avg)
+    logger.info("Attention Loss: %2.6f" % att_losses.avg)
     logger.info("Valid Accuracy: %2.5f" % accuracy)
 
     writer.add_scalar("test/accuracy", scalar_value=accuracy, global_step=epoch)
     if is_normal:
-        return accuracy, all_max_softmax[0], eval_losses.avg
+        return accuracy, att_losses.avg, all_attn_loss[0], all_max_softmax[0], eval_losses.avg
     else:
-        return all_max_softmax[0]
+        return att_losses.avg, all_attn_loss[0], all_max_softmax[0]
 
 
 def make_noise(x, epsilon=0.03):
@@ -325,6 +347,7 @@ def train(args, model):
 
     model.zero_grad()
     set_seed(args)  # Added here for reproducibility (even between python 2 and 3)
+    attentions = AverageMeter()
     losses = AverageMeter()
     epoch, best_acc = 0, 0
     if args.training_weights_dir:
@@ -332,7 +355,7 @@ def train(args, model):
     while True:
         model.train()
         epoch_iterator = tqdm(normal_train_loader,
-                              desc="Training (X / X Steps) (loss=X.X)",
+                              desc="Training (X / X Steps) (loss=X.X) (att_loss=X.X)",
                               bar_format="{l_bar}{r_bar}",
                               dynamic_ncols=True,
                               disable=args.local_rank not in [-1, 0],
@@ -346,6 +369,18 @@ def train(args, model):
                 visualize_attention(x, attn_mask, epoch, True, "Pics_Train_Normal")
             attn_weights = torch.stack(attn_weights, dim=1)
 
+            rotation_deg = 90
+            x_r = transforms.functional.rotate(x, rotation_deg)
+            loss_r, attn_weights_r = model(x_r, y)
+            attn_mask_r = get_att_mask(attn_weights_r)
+            attn_mask_r_reverse = transforms.functional.rotate(attn_mask_r, -rotation_deg)
+
+            if step == 0:
+                visualize_attention(x_r, attn_mask_r, epoch, True, "Pics_Train_Rotated")
+
+            attn_loss = torch.nn.functional.mse_loss(attn_mask, attn_mask_r_reverse)
+            loss += args.attn_loss_coef * attn_loss
+
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
             if args.fp16:
@@ -354,6 +389,7 @@ def train(args, model):
             else:
                 loss.backward()
             losses.update(loss.item() * args.gradient_accumulation_steps)
+            attentions.update(attn_loss.item())
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 if args.fp16:
                     torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
@@ -364,8 +400,8 @@ def train(args, model):
                 optimizer.zero_grad()
 
                 epoch_iterator.set_description(
-                    "Training (%d / %d Steps) (loss=%2.5f) " % (
-                        epoch, t_total, losses.avg)
+                    "Training (%d / %d Steps) (loss=%2.5f) (att_loss=%2.6f)" % (
+                        epoch, t_total, losses.avg, attentions.avg)
                 )
                 if args.local_rank in [-1, 0]:
                     writer.add_scalar("train/loss", scalar_value=losses.val, global_step=epoch)
@@ -375,21 +411,24 @@ def train(args, model):
         if args.local_rank in [-1, 0]:
             epoch += 1
 
-            accuracy, normal_all_max_softmax, eval_loss = valid(args, model, writer, normal_val_loader, epoch)
+            accuracy, normal_attn_loss, normal_all_attn_loss, normal_all_max_softmax, eval_loss = valid(args, model, writer, normal_val_loader, epoch)
 
-            outlier_all_max_softmax= valid(args, model, writer, outlier_val_loader, epoch, is_normal=False)
+            outlier_attn_loss, outlier_all_attn_loss, outlier_all_max_softmax = valid(args, model, writer, outlier_val_loader, epoch, is_normal=False)
+
+            attn_auc = roc_auc_score([0] * len(normal_all_attn_loss) + [1] * len(outlier_all_attn_loss),
+                                     np.append(normal_all_attn_loss, outlier_all_attn_loss, axis=0))
 
             max_softmax_auc = roc_auc_score([0] * len(outlier_all_max_softmax) + [1] * len(normal_all_max_softmax),
                                      np.append(outlier_all_max_softmax, normal_all_max_softmax, axis=0))
 
-            val_csv_writer.add_record([epoch, accuracy, max_softmax_auc, eval_loss])
+            val_csv_writer.add_record([epoch, accuracy, normal_attn_loss, outlier_attn_loss, attn_auc, max_softmax_auc, eval_loss])
 
             logger.info('AUC Score: %.5f' % max_softmax_auc)
             save_model_training(args, epoch, model, optimizer, scheduler, normal_train_loader)
             if best_acc < accuracy:
                 best_acc = accuracy
             model.train()
-            train_csv_writer.add_record([epoch, losses.avg])
+            train_csv_writer.add_record([epoch, losses.avg, attentions.avg])
             losses.reset()
         if epoch % t_total == 0:
             break
@@ -473,10 +512,11 @@ def main():
     global val_csv_writer
 
     train_csv_writer = CSV_Writer(path=args.csv_path + args.name + '_train.csv',
-                                  columns=(['epoch', 'train_loss']))
+                                  columns=(['epoch', 'train_loss', 'attention_loss']))
 
     val_csv_writer = CSV_Writer(path=args.csv_path + args.name + '_val.csv',
-                                columns=(['epoch', 'accuracy', 'max_softmax_auc', 'eval_loss']))
+                                columns=(['epoch', 'accuracy', 'normal_attn_loss', 'outlier_attn_loss', 'attn_auc',
+                                          'max_softmax_auc', 'eval_loss']))
 
     # Setup CUDA, GPU & distributed training 
     if args.local_rank == -1:
