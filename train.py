@@ -199,11 +199,8 @@ def valid(args, model, writer, test_loader, epoch, is_normal=True):
     for step, batch in enumerate(epoch_iterator):
         batch = tuple(t.to(args.device) for t in batch)
         x, y = batch
-        noised_x = pgd_attack(x, model, eps=args.pgd_eps, n_iter=args.pgd_iter)
         model.zero_grad()
         model.eval()
-        if step == 0:
-            visualize(x.clone(), noised_x.clone(), epoch, is_normal)
         with torch.no_grad():
             logits, attn_weights = model(x)
             attn_stack = torch.stack(attn_weights, dim=1)
