@@ -215,7 +215,7 @@ def valid(args, model, writer, test_loader, epoch, is_normal=True):
 
             attn_mask_r = get_att_mask(attn_weights_r)
             if step == 0:
-                visualize_attention(x_r, attn_mask_r, epoch, True, "Pics_Test_Rotated")
+                visualize_attention(x_r, attn_mask_r, epoch, is_normal, "Pics_Test_Rotated")
 
             attn_mask_r_reverse = transforms.functional.rotate(attn_mask_r, -rotation_deg)
             attn_diff = (attn_mask - attn_mask_r_reverse) ** 2
